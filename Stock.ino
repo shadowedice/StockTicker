@@ -12,12 +12,12 @@ const int WIFI_TIMEOUT = 30000; //In ms
 
 int serialPhase = 0;
 
-String ssid = "SSID";
-String password = "PASSWORD";
+String ssid = "XXXXXXXX";
+String password = "XXXXXXXX";
 
 bool connectSuccess = false;
 
-const char* host = "finance.google.com";
+char host[] = "api.iextrading.com";
 
 const int MAX_NUM_TICKERS = 50;
 const int LED_MATRIX_WIDTH = 64;
@@ -143,15 +143,15 @@ void checkSerial(){
 
 void updateCurrentTicker(){
   // Use WiFiClient class to create TCP connections
-  WiFiClient client;
-  const int httpPort = 80;
-  if (!client.connect(host, httpPort)) {
+  WiFiClientSecure client;
+  const int httpsPort = 443;
+  if (!client.connect(host, httpsPort)) {
     Serial.println("connection failed");
     return;
   }
 
   // This will send the request to the server
-  client.print(String("GET ") + "/finance?q=" + tickers[currentTicker] + "&output=json" + " HTTP/1.1\r\n" +
+  client.print(String("GET ") + "/1.0/stock/" + tickers[currentTicker] + "/quote" + " HTTP/1.1\r\n" +
     "Host: " + host + "\r\n" + 
     "Connection: close\r\n\r\n");
   unsigned long timeout = millis();
@@ -163,7 +163,7 @@ void updateCurrentTicker(){
     }
   }
 
-  // Read all the lines of the reply from server and print them to Serial
+  //Read all the lines of the reply from server and print them to Serial
   char status[32] = {0};
   client.readBytesUntil('\r', status, sizeof(status));
   if (strcmp(status, "HTTP/1.1 200 OK") != 0) {
@@ -175,10 +175,10 @@ void updateCurrentTicker(){
   char endOfHeaders[] = "\r\n\r\n";
   client.find(endOfHeaders) || Serial.print("Invalid response");
 
-  client.find("\"c\" : \"");
+  client.find("\"latestPrice\":");
+  values[currentTicker] = client.parseFloat();
+  client.find("\"change\":");
   changes[currentTicker] = client.parseFloat();
-  client.find("\"l\" : \"");
-  values[currentTicker] = client.parseFloat();  
 }
 
 String listOfTickers(){
@@ -376,4 +376,3 @@ void displayIP(){
     cur--;
   }
 }
-
