@@ -2,46 +2,82 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 
+#include <String.h>
+#include <NTPClient.h>
+#include <Time.h>
+#include <TimeLib.h>
+#include <Timezone.h>
+
+#define ARDUINOJSON_USE_DOUBLE 1
+#include <ArduinoJson.h>
+
+#include "keys.h"
+
+// Stock ticker settings
 const int EEPROM_SIZE = 512;  //Can be max of 4096
 const int WIFI_TIMEOUT = 30000; //In ms
-
 int serialPhase = 0;
-
-String ssid = "XXXXXXXX";
-String password = "XXXXXXXX";
-
 bool connectSuccess = false;
+bool startUpCall = true;
 
-char host[] = "api.iextrading.com";
+#define HOST  "apidojo-yahoo-finance-v1.p.rapidapi.com"
 
+// For HTTPS requests
+WiFiClientSecure client;
+
+// Clock Settings
+#define NTP_OFFSET   60 * 60      // In seconds
+#define NTP_INTERVAL 60 * 1000    // In miliseconds
+#define NTP_ADDRESS  "us.pool.ntp.org"  // change this to whatever pool is closest (see ntp.org)
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_ADDRESS, NTP_OFFSET, NTP_INTERVAL);
+
+// Variables for timing
 const int MAX_NUM_TICKERS = 50;
-const int LED_MATRIX_WIDTH = 64;
+const int LED_MATRIX_WIDTH = 32;
 const int LED_BRIGHTNESS = 30;
 const int LED_UPDATE_TIME = 75;  //In ms
+const int QUOTE_UPDATE_TIME = 1800000;
+const int CLOCK_UPDATE_TIME = 100;
+const int DATE_UPDATE_TIME = 300000;
 
+unsigned long updateLEDTime = 0;
+unsigned long updateQuoteTime = 0;
+unsigned long updateClockTime = 0;
+unsigned long updateDateTime = 0;
+
+// Variables for storing quote data
 int numTickers = 0;
 String tickers[MAX_NUM_TICKERS];
 float values[MAX_NUM_TICKERS];
-float changes[MAX_NUM_TICKERS];
+double changes[MAX_NUM_TICKERS];
 
+// Ticker Change website
 const char* header = "<h1>Ticker Updater</h1>";
 const char* tail = "<form  name='frm' method='post'>Ticker:<input type='text' name='ticker'><input type='submit' name ='Add' value='Add'><input type='submit' name='Remove' value='Remove'></form>";
-
-unsigned long updateLEDTime = 0;
 
 int currentTicker = 0;
 int currentCursor = LED_MATRIX_WIDTH;
 
-
 ESP8266WebServer server(80);
 
-Adafruit_NeoMatrix *matrix = new Adafruit_NeoMatrix(32, 8, 2, 1, 4,
-  NEO_MATRIX_TOP     + NEO_MATRIX_LEFT +
+// Variables for clock
+String date;
+String t;
+const char * days[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"} ;
+const char * months[] = {"Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sep", "Oct", "Nov", "Dec"} ;
+const char * ampm[] = {"AM", "PM"} ;
+
+// LED Matrix setup
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(32, 8, 0,
+  NEO_MATRIX_BOTTOM + NEO_MATRIX_RIGHT +
   NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG,
   NEO_GRB + NEO_KHZ800);
 
@@ -52,11 +88,14 @@ void setup(){
   //Read EEPROM to get ssid/password and stock tickers
   readEEPROM();
 
+  timeClient.begin();   // Start the NTP UDP client
+
   //Connect to the wifi
   Serial.println();
   Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
   WiFi.begin(ssid.c_str(), password.c_str());
 
   unsigned long start = millis();
@@ -84,32 +123,66 @@ void setup(){
   server.begin();
 
   //Setup the LED matrix
-  matrix->begin();
-  matrix->setTextWrap(false);
-  matrix->setBrightness(LED_BRIGHTNESS);
+  matrix.begin();
+  matrix.setTextWrap(false);
+  matrix.setBrightness(LED_BRIGHTNESS);
 
   displayIP();
+
+  //Set insecure so fingerprints are not needed
+  client.setInsecure();
 }
 
+// Clock Setup
+long lastTime = millis();
+int count_sec = 0;
+
+
 void loop(){
+  // Update time
+  if(millis()-lastTime>=1000){
+    count_sec++;
+    if(count_sec>70)
+      count_sec = 0;
+    lastTime = millis();
+    }
+
+  if(count_sec>60 || startUpCall){
+    read_time_date();
+  }
+    
   server.handleClient();
 
   checkSerial();
 
-  if(connectSuccess && currentCursor == LED_MATRIX_WIDTH)
-  {
-    updateCurrentTicker();
-    Serial.println(tickers[currentTicker] + " $" + values[currentTicker] + " " + changes[currentTicker]); 
-  }
+  // Setup vars for time conditions
+  String hour_string = t.substring(0,2);
+  String am_pm = t.substring(6,8);
 
-  if(millis() - updateLEDTime > LED_UPDATE_TIME)
-  {
-    if(connectSuccess)
-      displayStock();
-    else
-      displayNoConnection();
-    updateLEDTime = millis();
-  }
+  if(hour_string == "08" && am_pm == "AM" || hour_string == "09" && am_pm == "AM" || hour_string == "10" && am_pm == "AM" || hour_string == "11" && am_pm == "AM" ||
+      hour_string == "12" && am_pm == "PM" || hour_string == "01" && am_pm == "PM" || hour_string == "02" && am_pm == "PM" || hour_string == "03" && am_pm == "PM" ||
+      hour_string == "04" && am_pm == "PM"){
+    // Call Yahoo finance API every 30 mins, or at start up to update quote data
+      if(connectSuccess && currentCursor == LED_MATRIX_WIDTH && millis() - updateQuoteTime > QUOTE_UPDATE_TIME || connectSuccess && currentCursor == LED_MATRIX_WIDTH && startUpCall )
+      {
+        if(startUpCall == true){
+          startUpCall = false;
+        }
+        updateCurrentTicker();
+        updateQuoteTime = millis();
+    }
+      // Call function to update stock data displayed
+    if(millis() - updateLEDTime > LED_UPDATE_TIME){
+      if(connectSuccess){
+        displayStock();
+      }else{
+        displayNoConnection();
+      }
+      updateLEDTime = millis();
+    }
+  }else{
+    displayTime();
+  } 
 }
 
 void checkSerial(){
@@ -141,44 +214,91 @@ void checkSerial(){
   }
 }
 
+
 void updateCurrentTicker(){
+  Serial.println("Updating Tickers");
   // Use WiFiClient class to create TCP connections
-  WiFiClientSecure client;
-  const int httpsPort = 443;
-  if (!client.connect(host, httpsPort)) {
+  if (!client.connect(HOST, 443)) {
     Serial.println("connection failed");
     return;
   }
+  
+  // give the esp a breather
+  //yield();
 
-  // This will send the request to the server
-  client.print(String("GET ") + "/1.0/stock/" + tickers[currentTicker] + "/quote" + " HTTP/1.1\r\n" +
-    "Host: " + host + "\r\n" + 
-    "Connection: close\r\n\r\n");
-  unsigned long timeout = millis();
-  while (client.available() == 0) {
-    if (millis() - timeout > 5000) {
-      Serial.println(">>> Client Timeout !");
-      client.stop();
-      return;
+  // Send HTTPS request
+  client.print(F("GET "));
+  // This is the second half of a request (everything that comes after the base URL)
+  client.print(F("/market/v2/get-quotes?region=US&symbols="));
+  for(int i = 0; i < numTickers; i++){
+    client.print(tickers[i]);
+    //Serial.print(tickers[i]);
+    if(i != (numTickers - 1)){
+      client.print(F("%2C"));
+      //Serial.print("%2C");
     }
+  };
+  client.println(F(" HTTP/1.1"));
+
+  //Headers
+  client.print(F("Host: "));
+  client.println(HOST);
+  client.print(F("x-rapidapi-key: "));
+  client.println(X_RAPID_KEY);
+  client.print(F("x-rapidapi-host: "));
+  client.println(HOST);
+  //End of request
+  client.println(F("Cache-Control: no-cache"));
+  //client.println(F("Connection: close"));
+  
+  if (client.println() == 0)
+  {
+    Serial.println(F("Failed to send request"));
+    return;
   }
 
-  //Read all the lines of the reply from server and print them to Serial
+  // Check HTTP status
   char status[32] = {0};
   client.readBytesUntil('\r', status, sizeof(status));
-  if (strcmp(status, "HTTP/1.1 200 OK") != 0) {
-    Serial.print(status);
-    Serial.print("Unexpected HTTP response");
+  if (strcmp(status, "HTTP/1.1 200 OK") != 0)
+  {
+    Serial.print(F("Unexpected response: "));
+    Serial.println(status);
+    return;
   }
 
-  //Skip Headers
+  // Skip HTTP headers
   char endOfHeaders[] = "\r\n\r\n";
-  client.find(endOfHeaders) || Serial.print("Invalid response");
+  if (!client.find(endOfHeaders)) {
+    Serial.println(F("Invalid response"));
+    client.stop();
+    return;
+  }
 
-  client.find("\"latestPrice\":");
-  values[currentTicker] = client.parseFloat();
-  client.find("\"change\":");
-  changes[currentTicker] = client.parseFloat();
+  while (client.available()) {
+    // The filter: it contains "true" for each value we want to keep
+    StaticJsonDocument<200> filter;
+    JsonObject filter_quoteResponse_result_0 = filter["quoteResponse"]["result"].createNestedObject();
+    filter_quoteResponse_result_0["regularMarketChange"] = true;
+    filter_quoteResponse_result_0["regularMarketPrice"] = true;
+
+    // Setup Document Size, this is considerably larger than suggested to hopefully acomodate more quote requests
+    StaticJsonDocument<500> doc;
+    // Deserialize JSON response and check for errors
+    DeserializationError error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
+    
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.f_str());
+      return;
+    }
+    // Pull the value and change for each ticker requested. This has to be done in a for loop to make sure that all of the data
+    // is gotten. 
+    for(int i = 0; i < numTickers; i++){
+      changes[i] = doc["quoteResponse"]["result"][i]["regularMarketChange"];
+      values[i] = doc["quoteResponse"]["result"][i]["regularMarketPrice"];
+    }
+  }
 }
 
 String listOfTickers(){
@@ -315,23 +435,23 @@ void displayStock(){
   int bits = (tickers[currentTicker].length() + String(values[currentTicker]).length() + String(changes[currentTicker]).length() + sign + 3) * -6; 
   if(currentCursor > bits)
   {
-    matrix->clear();
-    matrix->setCursor(currentCursor,0);
-    matrix->setTextColor(matrix->Color(255,255,255));
-    matrix->print(tickers[currentTicker] + " ");
-    matrix->setTextColor(matrix->Color(255,255,0));
-    matrix->print("$" + String(values[currentTicker]) + " ");
+    matrix.clear();
+    matrix.setCursor(currentCursor,0);
+    matrix.setTextColor(matrix.Color(255,255,255));
+    matrix.print(tickers[currentTicker] + " ");
+    matrix.setTextColor(matrix.Color(255,255,0));
+    matrix.print("$" + String(values[currentTicker]) + " ");
     if(changes[currentTicker] >=0)
     {
-      matrix->setTextColor(matrix->Color(0,255,0));
-      matrix->print("+" + String(changes[currentTicker]) + " ");
+      matrix.setTextColor(matrix.Color(0,255,0));
+      matrix.print("+" + String(changes[currentTicker]) + " ");
     }
     else
     {
-      matrix->setTextColor(matrix->Color(255,0,0));
-      matrix->print(String(changes[currentTicker]) + " ");
+      matrix.setTextColor(matrix.Color(255,0,0));
+      matrix.print(String(changes[currentTicker]) + " ");
     }
-    matrix->show();
+    matrix.show();
     currentCursor--;
   }
   else
@@ -341,17 +461,18 @@ void displayStock(){
     if(currentTicker >= numTickers)
       currentTicker = 0;
     Serial.println("Current ticker is: " + String(currentTicker));
+    Serial.println(tickers[(currentTicker)] + " $" + values[(currentTicker)] + " " + changes[(currentTicker)]);
   }
 }
 
 void displayNoConnection(){
   if(currentCursor > -65)
   {
-    matrix->clear();
-    matrix->setCursor(currentCursor,0);
-    matrix->setTextColor(matrix->Color(255,255,255));
-    matrix->print("Unable to connect to network. Check network settings and restart.");
-    matrix->show();
+    matrix.clear();
+    matrix.setCursor(currentCursor,0);
+    matrix.setTextColor(matrix.Color(255,255,255));
+    matrix.print("Unable to connect to network. Check network settings and restart.");
+    matrix.show();
     currentCursor--;
   }
   else
@@ -367,12 +488,81 @@ void displayIP(){
   
   while(cur > chars)
   {
-    matrix->clear();
-    matrix->setCursor(cur,0);
-    matrix->setTextColor(matrix->Color(255,255,255));
-    matrix->print(ip);
-    matrix->show();
+    matrix.clear();
+    matrix.setCursor(cur,0);
+    matrix.setTextColor(matrix.Color(255,255,255));
+    matrix.print(ip);
+    matrix.show();
     delay(LED_UPDATE_TIME);
     cur--;
+  }
+}
+
+void read_time_date(){
+    date = "";  // clear the variables
+    t = "";
+    
+    // update the NTP client and get the UNIX UTC timestamp 
+    timeClient.update();
+    unsigned long epochTime =  timeClient.getEpochTime();
+
+    // convert received time stamp to time_t object
+    time_t local, utc;
+    utc = epochTime;
+
+    // Then convert the UTC UNIX timestamp to local time
+    TimeChangeRule usEDT = {"EDT", Second, Sun, Mar, 2, -360};  //UTC - 5 hours - change this as needed
+    TimeChangeRule usEST = {"EST", First, Sun, Nov, 2, -420};   //UTC - 6 hours - change this as needed
+    Timezone usEastern(usEDT, usEST);
+    local = usEastern.toLocal(utc);
+
+    // now format the Time variables into strings with proper names for month, day etc
+    date += days[weekday(local)-1];
+    date += ", ";
+    date += months[month(local)-1];
+    date += " ";
+    date += day(local);
+    date += ", ";
+    date += year(local);
+
+    // format the time to 12-hour format with AM/PM and no seconds
+    t += hourFormat12(local);
+    t += ":";
+    if(minute(local) < 10)  // add a zero if minute is under 10
+      t += "0";
+    t += minute(local);
+    t += " ";
+    t += ampm[isPM(local)];
+    if(t.length() < 8){
+      t = "0" + t;
+    }
+    //Serial.println(date);
+    //Serial.println(t);
+}
+
+void displayTime(){
+  if(millis() - updateClockTime > CLOCK_UPDATE_TIME ){
+    matrix.fillScreen(0);
+    matrix.setCursor(1, 0);
+    matrix.setTextColor(matrix.Color(255, 255, 255));
+    matrix.print(t);
+    matrix.show();
+    
+    updateClockTime = millis();
+  }else if(millis() - updateDateTime > DATE_UPDATE_TIME){
+    int cur = LED_MATRIX_WIDTH;
+    int chars = date.length() * -6;
+    
+    while(cur > chars)
+    {
+      matrix.clear();
+      matrix.setCursor(cur,0);
+      matrix.setTextColor(matrix.Color(255,255,255));
+      matrix.print(date);
+      matrix.show();
+      delay(LED_UPDATE_TIME);
+      cur--;
+    }
+    updateDateTime = millis();
   }
 }
