@@ -76,7 +76,7 @@ const char * months[] = {"Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug
 const char * ampm[] = {"AM", "PM"} ;
 
 // LED Matrix setup
-Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(32, 8, 0,
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(32, 8, 2, 1, 0,
   NEO_MATRIX_BOTTOM + NEO_MATRIX_RIGHT +
   NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG,
   NEO_GRB + NEO_KHZ800);
